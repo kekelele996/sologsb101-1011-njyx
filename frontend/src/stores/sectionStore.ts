@@ -11,6 +11,15 @@ import type { Vertical } from '@/types/vertical'
 import { buildRelativeDepths } from '@/types/vertical'
 import type { Point } from '@/types/point'
 
+/**
+ * 测站改动垂线或流速测点后，作废该测次已出具的整编回执。
+ * 懒引用 compileStore，避免 store 初始化顺序耦合。
+ */
+async function voidCompileReceipt(sectionId: string): Promise<void> {
+  const { useCompileStore } = await import('@/stores/compileStore')
+  await useCompileStore().voidReceipt(sectionId)
+}
+
 /** 垂线录入草稿（新增/编辑表单共享结构） */
 export interface VerticalDraft {
   no: number
@@ -224,22 +233,28 @@ export const useSectionStore = defineStore('section', () => {
       updatedAt: now + index
     }))
     if (pointRows.length > 0) await db.points.bulkPut(pointRows)
+    await voidCompileReceipt(sectionId)
     return row
   }
 
   async function updateVertical(id: string, patch: Partial<Vertical>): Promise<void> {
+    const vertical = verticals.value.find((item) => item.id === id)
     await db.verticals.update(id, { ...patch, updatedAt: Date.now() } as never)
+    if (vertical) await voidCompileReceipt(vertical.sectionId)
   }
 
   async function removeVertical(id: string): Promise<void> {
+    const vertical = verticals.value.find((item) => item.id === id)
     await db.transaction('rw', [db.verticals, db.points], async () => {
       await db.points.where('verticalId').equals(id).delete()
       await db.verticals.delete(id)
     })
+    if (vertical) await voidCompileReceipt(vertical.sectionId)
   }
 
   /** 按测点数重排该垂线的测点行（保持已有流速值，缺失的补默认） */
   async function regeneratePoints(verticalId: string, pointCount: number): Promise<number> {
+    const vertical = verticals.value.find((item) => item.id === verticalId)
     const existing = pointsOfVertical(verticalId)
     const depths = buildRelativeDepths(pointCount)
     const now = Date.now()
@@ -261,6 +276,7 @@ export const useSectionStore = defineStore('section', () => {
       if (rows.length > 0) await db.points.bulkPut(rows)
       await db.verticals.update(verticalId, { pointCount: rows.length, updatedAt: now } as never)
     })
+    if (vertical) await voidCompileReceipt(vertical.sectionId)
     return rows.length
   }
 
@@ -274,17 +290,28 @@ export const useSectionStore = defineStore('section', () => {
     const row: Point = { ...payload, verticalId, id: createId('pnt'), createdAt: now, updatedAt: now }
     await db.points.put(row)
     await syncVerticalPointCount(verticalId)
+    const vertical = verticals.value.find((item) => item.id === verticalId)
+    if (vertical) await voidCompileReceipt(vertical.sectionId)
     return row
   }
 
   async function updatePoint(id: string, patch: Partial<Point>): Promise<void> {
+    const point = points.value.find((item) => item.id === id)
     await db.points.update(id, { ...patch, updatedAt: Date.now() } as never)
+    if (point) {
+      const vertical = verticals.value.find((item) => item.id === point.verticalId)
+      if (vertical) await voidCompileReceipt(vertical.sectionId)
+    }
   }
 
   async function removePoint(id: string): Promise<void> {
     const point = points.value.find((item) => item.id === id)
     await db.points.delete(id)
-    if (point) await syncVerticalPointCount(point.verticalId)
+    if (point) {
+      await syncVerticalPointCount(point.verticalId)
+      const vertical = verticals.value.find((item) => item.id === point.verticalId)
+      if (vertical) await voidCompileReceipt(vertical.sectionId)
+    }
   }
 
   /** 批量改写某垂线全部测点流速（批量录入） */
@@ -297,6 +324,8 @@ export const useSectionStore = defineStore('section', () => {
         point.velocityMs = velocityMs
         point.updatedAt = now
       })
+    const vertical = verticals.value.find((item) => item.id === verticalId)
+    if (vertical) await voidCompileReceipt(vertical.sectionId)
     return pointsOfVertical(verticalId).length
   }
 
@@ -321,6 +350,8 @@ export const useSectionStore = defineStore('section', () => {
       await db.points.bulkPut(records)
       await db.verticals.update(verticalId, { pointCount: records.length, updatedAt: now } as never)
     })
+    const vertical = verticals.value.find((item) => item.id === verticalId)
+    if (vertical) await voidCompileReceipt(vertical.sectionId)
     return records.length
   }
 
@@ -335,6 +366,8 @@ export const useSectionStore = defineStore('section', () => {
     if (rows.length === 0) return 0
     const weight = Number((1 / rows.length).toFixed(4))
     await db.points.bulkPut(rows.map((row) => ({ ...row, weight, updatedAt: Date.now() })))
+    const vertical = verticals.value.find((item) => item.id === verticalId)
+    if (vertical) await voidCompileReceipt(vertical.sectionId)
     return rows.length
   }
 

@@ -5,10 +5,11 @@
  */
 import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { DataLine, Files, Histogram, Odometer, PieChart, TrendCharts } from '@element-plus/icons-vue'
+import { DataLine, Files, Histogram, Odometer, PieChart, Stamp, TrendCharts } from '@element-plus/icons-vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
 import { useRatingStore } from '@/stores/ratingStore'
+import { useCompileStore } from '@/stores/compileStore'
 import { DB_NAME, DB_VERSION } from '@/utils/db'
 
 const route = useRoute()
@@ -16,11 +17,13 @@ const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
 const ratingStore = useRatingStore()
+const compileStore = useCompileStore()
 
 onMounted(() => {
   stationStore.start()
   sectionStore.start()
   ratingStore.start()
+  compileStore.start()
 })
 
 /** 层级路由统一归属到最上层导航项 */
@@ -34,6 +37,7 @@ const activeKey = computed(() => {
 const navItems = computed(() => [
   { key: '/stations', label: '测站台账', icon: Odometer, badge: String(stationStore.stations.length) },
   { key: '/ratings', label: '关系点据与定线', icon: TrendCharts, badge: String(ratingStore.ratings.length) },
+  { key: '/compile', label: '整编中心', icon: Stamp, badge: String(compileStore.compileQueue.length) },
   { key: '/export', label: '比测与导出', icon: PieChart, badge: String(ratingStore.overLimitRows.length) }
 ])
 

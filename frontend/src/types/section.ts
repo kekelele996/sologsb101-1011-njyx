@@ -18,6 +18,10 @@ export interface Section {
   method: MeasureMethod
   /** 测流时间 */
   measuredAt: string
+  /** 整编状态：待整编 / 已报整编 / 已完成（回执到了才算完成） */
+  compileStatus: import('./receipt').CompileStatus
+  /** 历史遗留只读：升级时认不出归属的测次，单列只读保留，不可编辑 / 报整编 */
+  legacyReadonly: boolean
   createdAt: number
   updatedAt: number
 }

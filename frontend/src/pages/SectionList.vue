@@ -6,14 +6,16 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, Edit, Plus, Right, Timer } from '@element-plus/icons-vue'
+import { Delete, Edit, Plus, Promotion, Right, Timer } from '@element-plus/icons-vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import type { FilterModel } from '@/types/filter'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
+import CompileStatusTag from '@/components/common/CompileStatusTag.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
+import { useCompileStore } from '@/stores/compileStore'
 import { MEASURE_METHODS, type MeasureMethod, type Section } from '@/types/section'
 import { initDatabase } from '@/utils/db'
 
@@ -21,6 +23,7 @@ const route = useRoute()
 const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
+const compileStore = useCompileStore()
 
 const stationId = computed(() => String(route.params.id ?? ''))
 const station = computed(() => stationStore.stationById(stationId.value))
@@ -46,6 +49,13 @@ const sectionRows = computed(() => {
     return true
   })
 })
+
+/** 历史遗留只读测次：升级时认不出归属的，单列只读保留 */
+const legacySections = computed(() =>
+  sectionStore
+    .sectionsOfStation(stationId.value)
+    .filter((section) => section.legacyReadonly)
+)
 
 const filterModel = computed<FilterModel>(() => ({
   keyword: sectionStore.filter.keyword,
@@ -120,7 +130,9 @@ async function submitForm(): Promise<void> {
       startDistanceM: form.startDistanceM,
       stageM: form.stageM,
       method: form.method,
-      measuredAt: new Date(form.measuredAt).toISOString()
+      measuredAt: new Date(form.measuredAt).toISOString(),
+      compileStatus: 'pending' as const,
+      legacyReadonly: false
     }
     if (editingId.value) {
       await sectionStore.updateSection(editingId.value, payload)
@@ -150,6 +162,13 @@ async function removeSection(section: Section): Promise<void> {
   ElMessage.success('测次及其垂线测点已删除')
 }
 
+/** 测站报整编：测流成果报去流域整编中心 */
+async function submitForCompile(section: Section): Promise<void> {
+  if (section.legacyReadonly) return
+  await compileStore.submitForCompile(section.id)
+  ElMessage.success(`测次 ${section.measureNo} 已报整编，等待整编端出具回执`)
+}
+
 function gotoVerticals(section: Section): void {
   sectionStore.selectSection(section.id)
   void router.push(`/sections/${section.id}/verticals`)
@@ -176,6 +195,7 @@ function reseedIfEmpty(): void {
 
 onMounted(() => {
   reseedIfEmpty()
+  compileStore.start()
   const query = route.query
   sectionStore.patchFilter({
     keyword: typeof query.kw === 'string' ? query.kw : '',
@@ -298,22 +318,58 @@ onMounted(() => {
             </el-button>
           </template>
         </el-table-column>
+        <el-table-column label="整编状态" width="110">
+          <template #default="{ row }">
+            <CompileStatusTag v-if="!row.legacyReadonly" :status="row.compileStatus" />
+            <el-tag v-else size="small" type="info" effect="plain">只读</el-tag>
+          </template>
+        </el-table-column>
         <el-table-column label="测流时间" min-width="170">
           <template #default="{ row }">
             <span class="gb-mono">{{ new Date(row.measuredAt).toLocaleString('zh-CN') }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="240" fixed="right">
+        <el-table-column label="操作" width="320" fixed="right">
           <template #default="{ row }">
             <el-button size="small" type="primary" :icon="Right" @click="gotoVerticals(row)">垂线</el-button>
-            <el-button size="small" :icon="Edit" @click="openEdit(row)">编辑</el-button>
-            <el-button size="small" type="danger" plain :icon="Delete" @click="removeSection(row)">删除</el-button>
+            <el-button size="small" :icon="Edit" :disabled="row.legacyReadonly" @click="openEdit(row)">编辑</el-button>
+            <el-button size="small" type="danger" plain :icon="Delete" :disabled="row.legacyReadonly" @click="removeSection(row)">删除</el-button>
+            <el-button
+              v-if="!row.legacyReadonly && row.compileStatus === 'pending'"
+              size="small"
+              type="success"
+              plain
+              :icon="Promotion"
+              @click="submitForCompile(row)"
+            >报整编</el-button>
           </template>
         </el-table-column>
         <template #empty>
           <EmptyPanel title="暂无测次" description="点击右上角「新增测次」开始录入。" compact />
         </template>
       </el-table>
+
+      <!-- 历史遗留只读测次：升级时认不出归属的，单列只读保留 -->
+      <el-card v-if="legacySections.length > 0" shadow="never" class="page__legacy-card">
+        <div class="gb-panel-title">
+          <h3>历史遗留测次（只读保留）</h3>
+          <span class="gb-hint">升级时认不出归属的测次，单列只读保留，不可编辑或报整编</span>
+        </div>
+        <el-table :data="legacySections" border size="small" class="gb-table-compact">
+          <el-table-column prop="measureNo" label="测次号" min-width="150" />
+          <el-table-column label="水位 (m)" width="110" align="right">
+            <template #default="{ row }"><span class="gb-mono">{{ row.stageM.toFixed(2) }}</span></template>
+          </el-table-column>
+          <el-table-column label="测法" width="110">
+            <template #default="{ row }">
+              <el-tag size="small" effect="plain">{{ row.method }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="状态" width="110">
+            <template #default="{ row }"><el-tag size="small" type="info" effect="plain">只读</el-tag></template>
+          </el-table-column>
+        </el-table>
+      </el-card>
 
       <p class="gb-hint">
         <el-icon><Timer /></el-icon>

@@ -199,6 +199,20 @@ export const useRatingStore = defineStore('rating', () => {
       targetLine
     )
     setFit(fit)
+    return rebuildComparesFromFit(targetLine, fit)
+  }
+
+  /**
+   * 按整编回执给定的定线参数重算比测记录：
+   * 回执动过定线参数的，测站按整编端给的参数重算曲线流量、残差与比测结论。
+   */
+  async function rebuildComparesWithParams(lineNo: string, fit: RatingFitResult): Promise<number> {
+    setFit(fit)
+    return rebuildComparesFromFit(lineNo, fit)
+  }
+
+  /** 由定线参数重算某定线的全部比测记录（内部共用） */
+  async function rebuildComparesFromFit(targetLine: string, fit: RatingFitResult): Promise<number> {
     const targets = ratings.value.filter((rating) => rating.lineNo === targetLine)
     if (targets.length === 0) return 0
     const now = Date.now()
@@ -283,6 +297,7 @@ export const useRatingStore = defineStore('rating', () => {
     updateRating,
     removeRating,
     rebuildCompares,
+    rebuildComparesWithParams,
     createCompare,
     updateCompare,
     removeCompare

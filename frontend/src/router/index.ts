@@ -38,6 +38,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '水位流量关系点据', icon: 'TrendCharts' }
   },
   {
+    path: '/compile',
+    name: 'compile-center',
+    component: () => import('@/pages/CompileCenter.vue'),
+    meta: { title: '整编中心', icon: 'Stamp' }
+  },
+  {
     path: '/export',
     name: 'export-view',
     component: () => import('@/pages/ExportView.vue'),

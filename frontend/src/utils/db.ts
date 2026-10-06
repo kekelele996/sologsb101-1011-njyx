@@ -12,12 +12,13 @@ import type { Vertical } from '@/types/vertical'
 import type { Point } from '@/types/point'
 import type { Rating } from '@/types/rating'
 import type { Compare } from '@/types/compare'
+import type { Receipt } from '@/types/receipt'
 import { calcDeviationPct, judgeDeviation } from '@/types/compare'
 import { fitPowerCurve } from '@/types/rating'
 import { calcMeanVelocity, DEFAULT_WEIGHTS, round } from '@/utils/flow'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbhydrogaug'
@@ -40,6 +41,7 @@ export interface BackupPayload {
   points: Point[]
   ratings: Rating[]
   compares: Compare[]
+  receipts: Receipt[]
 }
 
 class HydroGaugeDatabase extends Dexie {
@@ -49,6 +51,7 @@ class HydroGaugeDatabase extends Dexie {
   points!: Table<Point, string>
   ratings!: Table<Rating, string>
   compares!: Table<Compare, string>
+  receipts!: Table<Receipt, string>
 
   constructor() {
     super(DB_NAME)
@@ -64,7 +67,7 @@ class HydroGaugeDatabase extends Dexie {
     })
 
     // v2：补齐筛选与统计需要的索引（河名/集水面积、水位、测法、偏差判定）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
         sections: 'id, stationId, measureNo, method, stageM, measuredAt, updatedAt',
@@ -94,6 +97,44 @@ class HydroGaugeDatabase extends Dexie {
               Object.assign(row, defaults())
             })
         }
+      })
+
+    // v3：新增整编回执表；测次补整编状态与历史遗留只读标记。
+    // 旧数据没有报整编标识，升级时按有没有回执回填整编状态，认不出归属的测次单列只读保留。
+    this.version(DB_VERSION)
+      .stores({
+        stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
+        sections: 'id, stationId, measureNo, method, stageM, measuredAt, compileStatus, legacyReadonly, updatedAt',
+        verticals: 'id, sectionId, no, startDistanceM, depthM, updatedAt',
+        points: 'id, verticalId, relativeDepth, velocityMs, updatedAt',
+        ratings: 'id, stationId, lineNo, stageM, flowM3s, measuredAt, updatedAt',
+        compares: 'id, ratingId, verdict, deviationPct, comparedAt, updatedAt',
+        receipts: 'id, measureNo, stationId, sectionId, status, receivedAt, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        const now = Date.now()
+        const stationIds = new Set<string>(
+          (await tx.table('stations').toArray()).map((row: Station) => row.id)
+        )
+        // 旧库中没有回执表（v3 新增），此处读不到历史回执，全部测次按待整编回填；
+        // 保留「按回执回填」逻辑以便未来从含回执的版本升级时复用。
+        const existingReceipts: Receipt[] = await tx.table('receipts').toArray()
+        const receiptBySection = new Map<string, Receipt>()
+        existingReceipts.forEach((receipt) => {
+          if (!receiptBySection.has(receipt.sectionId)) receiptBySection.set(receipt.sectionId, receipt)
+        })
+        await tx
+          .table('sections')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.createdAt !== 'number') row.createdAt = now
+            if (typeof row.updatedAt !== 'number') row.updatedAt = row.createdAt
+            // 按有没有回执回填整编状态
+            const receipt = receiptBySection.get(row.id as string)
+            row.compileStatus = receipt && receipt.status === 'accepted' ? 'accepted' : 'pending'
+            // 认不出归属（测站已不存在）的测次单列只读保留
+            row.legacyReadonly = !stationIds.has(row.stationId as string)
+          })
       })
   }
 }
@@ -155,7 +196,9 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 12.5,
           stageM: 5.42,
           method: '流速仪',
-          measuredAt: '2024-06-12T08:30:00.000Z'
+          measuredAt: '2024-06-12T08:30:00.000Z',
+          compileStatus: 'accepted',
+          legacyReadonly: false
         },
         {
           id: 'sec_lh_2407',
@@ -164,7 +207,9 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 12.5,
           stageM: 6.15,
           method: 'ADCP',
-          measuredAt: '2024-07-18T09:10:00.000Z'
+          measuredAt: '2024-07-18T09:10:00.000Z',
+          compileStatus: 'pending',
+          legacyReadonly: false
         }
       ],
       verticals: [
@@ -203,7 +248,9 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 4.2,
           stageM: 3.18,
           method: '浮标',
-          measuredAt: '2024-05-22T07:50:00.000Z'
+          measuredAt: '2024-05-22T07:50:00.000Z',
+          compileStatus: 'pending',
+          legacyReadonly: false
         },
         {
           id: 'sec_qj_2408',
@@ -212,7 +259,9 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 4.2,
           stageM: 4.36,
           method: '流速仪',
-          measuredAt: '2024-08-09T06:40:00.000Z'
+          measuredAt: '2024-08-09T06:40:00.000Z',
+          compileStatus: 'submitted',
+          legacyReadonly: false
         }
       ],
       verticals: [
@@ -251,7 +300,9 @@ export async function seedDemoData(): Promise<void> {
           startDistanceM: 18.0,
           stageM: 5.36,
           method: 'ADCP',
-          measuredAt: '2024-06-20T10:05:00.000Z'
+          measuredAt: '2024-06-20T10:05:00.000Z',
+          compileStatus: 'pending',
+          legacyReadonly: false
         }
       ],
       verticals: [
@@ -316,9 +367,74 @@ export async function seedDemoData(): Promise<void> {
       )
       await db.ratings.bulkPut(ratingSeeds.map((rating) => ({ ...rating, ...stamp(rating) })))
 
+      // 定线分组：按定线号聚合点据，供整编回执与比测记录共用
+      const lineGroups = new Map<string, Array<{ stageM: number; flowM3s: number }>>()
+      ratingSeeds.forEach((rating) => {
+        const list = lineGroups.get(rating.lineNo) ?? []
+        list.push({ stageM: rating.stageM, flowM3s: rating.flowM3s })
+        lineGroups.set(rating.lineNo, list)
+      })
+
+      // 整编回执：按测次号与测站对账。龙门 2024-06-001 已受理（采用 A 线参数），
+      // 青矶 2024-05-003 曾被驳回（历史回执保留，测站已按意见重报待整编）。
+      const receiptSeeds: Receipt[] = []
+      const fitByLine = new Map<string, ReturnType<typeof fitPowerCurve>>()
+      lineGroups.forEach((points, lineNo) => fitByLine.set(lineNo, fitPowerCurve(points, lineNo)))
+      const acceptedFit = fitByLine.get('A')
+      if (acceptedFit?.valid) {
+        const section = stationBundles[0].sections[0]
+        receiptSeeds.push({
+          id: 'rcp_lh_2406',
+          measureNo: section.measureNo,
+          stationId: section.stationId,
+          sectionId: section.id,
+          status: 'accepted',
+          lineNo: 'A',
+          a: acceptedFit.a,
+          b: acceptedFit.b,
+          h0: acceptedFit.h0,
+          compiledFlowM3s: round(
+            acceptedFit.a * Math.pow(Math.max(section.stageM - acceptedFit.h0, 1e-6), acceptedFit.b),
+            2
+          ),
+          meanResidualPct: acceptedFit.meanResidualPct,
+          maxResidualPct: acceptedFit.maxResidualPct,
+          sampleCount: acceptedFit.sampleCount,
+          operator: '整编中心·林昭',
+          receivedAt: '2024-06-15T10:00:00.000Z',
+          note: '采用 A 线定线参数，整编流量按回执参数推求',
+          createdAt: now,
+          updatedAt: now
+        })
+      }
+      const rejectedFit = fitByLine.get('B')
+      if (rejectedFit?.valid) {
+        const section = stationBundles[1].sections[0]
+        receiptSeeds.push({
+          id: 'rcp_qj_2405',
+          measureNo: section.measureNo,
+          stationId: section.stationId,
+          sectionId: section.id,
+          status: 'rejected',
+          lineNo: 'B',
+          a: rejectedFit.a,
+          b: rejectedFit.b,
+          h0: rejectedFit.h0,
+          compiledFlowM3s: 0,
+          meanResidualPct: rejectedFit.meanResidualPct,
+          maxResidualPct: rejectedFit.maxResidualPct,
+          sampleCount: rejectedFit.sampleCount,
+          operator: '整编中心·周渝',
+          receivedAt: '2024-05-25T09:30:00.000Z',
+          note: '浮标法系数偏大，请复核后重报',
+          createdAt: now + 1,
+          updatedAt: now + 1
+        })
+      }
+      await db.receipts.bulkPut(receiptSeeds)
+
       // 比测记录：按定线拟合出曲线流量后计算偏差与判定，保证与页面展示一致
       const compares: Compare[] = []
-      const lineGroups = new Map<string, Array<{ stageM: number; flowM3s: number }>>()
       ratingSeeds.forEach((rating) => {
         const list = lineGroups.get(rating.lineNo) ?? []
         list.push({ stageM: rating.stageM, flowM3s: rating.flowM3s })
@@ -375,7 +491,7 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.receipts],
     async () => {
       await Promise.all([
         db.stations.clear(),
@@ -383,7 +499,8 @@ export async function clearAllTables(): Promise<void> {
         db.verticals.clear(),
         db.points.clear(),
         db.ratings.clear(),
-        db.compares.clear()
+        db.compares.clear(),
+        db.receipts.clear()
       ])
     }
   )
@@ -397,15 +514,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与导出页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
+  const [stations, sections, verticals, points, ratings, compares, receipts] = await Promise.all([
     db.stations.count(),
     db.sections.count(),
     db.verticals.count(),
     db.points.count(),
     db.ratings.count(),
-    db.compares.count()
+    db.compares.count(),
+    db.receipts.count()
   ])
-  return { stations, sections, verticals, points, ratings, compares }
+  return { stations, sections, verticals, points, ratings, compares, receipts }
 }
 
 /** 写入结构版本号到 localStorage，便于导出页比对 */
