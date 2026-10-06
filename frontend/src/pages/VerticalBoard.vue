@@ -13,6 +13,7 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
+import { useArchiveStore } from '@/stores/archiveStore'
 import { buildRelativeDepths, type Vertical } from '@/types/vertical'
 import { calcMeanVelocity, calcSectionDischarge } from '@/utils/flow'
 import { initDatabase } from '@/utils/db'
@@ -21,6 +22,7 @@ const route = useRoute()
 const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
+const archiveStore = useArchiveStore()
 
 const sectionId = computed(() => String(route.params.id ?? ''))
 const section = computed(() => sectionStore.sectionById(sectionId.value))
@@ -39,6 +41,9 @@ const form = reactive({
 
 const verticals = computed(() => sectionStore.verticalsOfSection(sectionId.value))
 const conflicts = computed(() => (section.value ? sectionStore.findDistanceConflicts(sectionId.value) : []))
+
+/** 该测次的整编报送状态：回执到达后再改垂线，原回执会作废 */
+const archiveRow = computed(() => (section.value ? archiveStore.submissionBySection(section.value.id) : null))
 
 /** 每条垂线的平均流速（按测点权重加权）与单宽流量 */
 const verticalRows = computed(() =>
@@ -172,6 +177,7 @@ function gotoPoints(vertical: Vertical): void {
 
 onMounted(() => {
   if (stationStore.stations.length === 0) void initDatabase()
+  archiveStore.start()
   sectionStore.selectSection(sectionId.value)
 })
 </script>
@@ -232,6 +238,21 @@ onMounted(() => {
         show-icon
         :closable="false"
         :title="`起点距排序校验未通过：垂线 ${conflicts.join('、')} 的起点距与其他垂线重复，请调整后再参与流量计算`"
+      />
+
+      <el-alert
+        v-if="archiveRow?.status === '完成'"
+        type="info"
+        show-icon
+        :closable="false"
+        title="本测次已有整编回执、整编已完成；现在改动垂线布设会让原回执作废，测次退回待整编，需要重新报送并按新回执走。"
+      />
+      <el-alert
+        v-else-if="archiveRow?.receiptVoided"
+        type="warning"
+        show-icon
+        :closable="false"
+        :title="`原整编回执已作废（${archiveRow.voidReason || '测站改动了垂线 / 流速测点'}），本测次已退回待整编，重报后照新回执走。`"
       />
 
       <EmptyPanel

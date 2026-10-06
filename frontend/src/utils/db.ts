@@ -12,12 +12,15 @@ import type { Vertical } from '@/types/vertical'
 import type { Point } from '@/types/point'
 import type { Rating } from '@/types/rating'
 import type { Compare } from '@/types/compare'
+import type { CenterArchive, Receipt, SubmissionArchive } from '@/types/submission'
+import { buildReceipt, type RatingParams } from '@/types/submission'
 import { calcDeviationPct, judgeDeviation } from '@/types/compare'
 import { fitPowerCurve } from '@/types/rating'
 import { calcMeanVelocity, DEFAULT_WEIGHTS, round } from '@/utils/flow'
+import { applyReceiptToSubmission, buildResultSnapshot } from '@/utils/submissionFlow'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbhydrogaug'
@@ -40,6 +43,8 @@ export interface BackupPayload {
   points: Point[]
   ratings: Rating[]
   compares: Compare[]
+  submissions: SubmissionArchive[]
+  centerArchives: CenterArchive[]
 }
 
 class HydroGaugeDatabase extends Dexie {
@@ -49,6 +54,10 @@ class HydroGaugeDatabase extends Dexie {
   points!: Table<Point, string>
   ratings!: Table<Rating, string>
   compares!: Table<Compare, string>
+  /** 测站侧报送档：一测次一行 */
+  submissions!: Table<SubmissionArchive, string>
+  /** 整编端档：一测次一行，按测次号与测站对上 */
+  centerArchives!: Table<CenterArchive, string>
 
   constructor() {
     super(DB_NAME)
@@ -64,7 +73,7 @@ class HydroGaugeDatabase extends Dexie {
     })
 
     // v2：补齐筛选与统计需要的索引（河名/集水面积、水位、测法、偏差判定）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
         sections: 'id, stationId, measureNo, method, stageM, measuredAt, updatedAt',
@@ -94,6 +103,137 @@ class HydroGaugeDatabase extends Dexie {
               Object.assign(row, defaults())
             })
         }
+      })
+
+    // v3：测流成果报整编——新增测站报送档与整编端档（各留各的档，按测次号对上）
+    this.version(DB_VERSION)
+      .stores({
+        // 既有六表索引不变（Dexie 会自动沿用），仅声明两张新表
+        submissions: 'id, sectionId, stationId, measureNo, status, reportSeq, receiptVoided, legacyUnmatched',
+        centerArchives: 'id, submissionId, stationId, sectionId, measureNo, status, reportSeq, legacyUnmatched'
+      })
+      .upgrade(async (tx) => {
+        // 旧数据没有报整编标识：按有没有回执回填，认不出的单列出来只读保留。
+        const sections = await tx.table<Section>('sections').toArray()
+        const verticals = await tx.table<Vertical>('verticals').toArray()
+        const points = await tx.table<Point>('points').toArray()
+        const ratings = await tx.table<Rating>('ratings').toArray()
+        const compares = await tx.table<Compare>('compares').toArray()
+
+        const now = Date.now()
+        const submissionRows: SubmissionArchive[] = []
+        const centerRows: CenterArchive[] = []
+
+        sections.forEach((section) => {
+          // 旧数据本地没有整编端，回填不出真回执，一律按「无回执 → 待整编」处理
+          const snapshot = buildResultSnapshot(section, verticals, points, ratings)
+          submissionRows.push({
+            id: createId('sub'),
+            sectionId: section.id,
+            stationId: section.stationId,
+            measureNo: section.measureNo,
+            method: section.method,
+            status: '待整编',
+            reportSeq: 0,
+            reportedAt: null,
+            snapshot,
+            receipt: null,
+            receiptVoided: false,
+            voidReason: '',
+            rejectReason: '',
+            legacyUnmatched: false,
+            legacyBackfilled: true,
+            createdAt: section.createdAt ?? now,
+            updatedAt: now
+          })
+        })
+
+        // 认不出的旧档：关系点据/比测里存在、但在断面表中找不到对应测次号的，单列只读保留
+        const sectionMeasureNos = new Set(sections.map((section) => section.measureNo))
+        const unmatchedNos = new Set<string>()
+        ratings.forEach((rating) => {
+          if (rating.measureNo && !sectionMeasureNos.has(rating.measureNo)) unmatchedNos.add(rating.measureNo)
+        })
+        let unmatchedIndex = 0
+        unmatchedNos.forEach((measureNo) => {
+          unmatchedIndex += 1
+          const rating = ratings.find((item) => item.measureNo === measureNo)
+          const compare = rating ? compares.find((item) => item.ratingId === rating.id) ?? null : null
+          const baseId = `sub_legacy_${unmatchedIndex}`
+          const common = {
+            sectionId: '',
+            stationId: rating?.stationId ?? '',
+            measureNo,
+            method: '',
+            reportSeq: 0,
+            reportedAt: rating?.measuredAt ?? null,
+            snapshot: rating
+              ? {
+                  stageM: rating.stageM,
+                  measuredFlow: rating.flowM3s,
+                  areaM2: 0,
+                  meanVelocityMs: 0,
+                  verticalCount: 0,
+                  pointCount: 0,
+                  stationParams: null
+                }
+              : null,
+            legacyUnmatched: true,
+            legacyBackfilled: true
+          }
+          let receipt: SubmissionArchive['receipt'] = null
+          if (compare) {
+            const adopted: RatingParams = {
+              lineNo: rating?.lineNo ?? 'A',
+              a: 0,
+              b: 0,
+              h0: 0
+            }
+            receipt = {
+              receiptNo: `HZ-LEGACY-${String(unmatchedIndex).padStart(3, '0')}`,
+              receiptAt: compare.comparedAt,
+              editor: compare.operator || '历史资料',
+              adoptedParams: adopted,
+              ratedFlow: compare.curveFlow,
+              residualPct: compare.deviationPct,
+              verdict: compare.verdict,
+              paramsChanged: false,
+              note: '升级回填：旧比测记录识别出的回执，定线参数已不可考'
+            }
+          }
+          submissionRows.push({
+            ...common,
+            id: baseId,
+            status: receipt ? '完成' : '待整编',
+            receipt,
+            receiptVoided: false,
+            voidReason: '',
+            rejectReason: '',
+            createdAt: rating?.createdAt ?? now,
+            updatedAt: now
+          })
+          centerRows.push({
+            id: `cen_legacy_${unmatchedIndex}`,
+            submissionId: baseId,
+            stationId: rating?.stationId ?? '',
+            sectionId: '',
+            measureNo,
+            method: '',
+            status: receipt ? '完成' : '待整编',
+            reportSeq: 0,
+            receivedAt: rating?.measuredAt ?? null,
+            lastReceivedAt: rating?.measuredAt ?? null,
+            snapshot: null,
+            receipt,
+            remarks: [],
+            legacyUnmatched: true,
+            createdAt: rating?.createdAt ?? now,
+            updatedAt: now
+          })
+        })
+
+        if (submissionRows.length > 0) await tx.table('submissions').bulkPut(submissionRows)
+        if (centerRows.length > 0) await tx.table('centerArchives').bulkPut(centerRows)
       })
   }
 }
@@ -289,7 +429,7 @@ export async function seedDemoData(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.submissions, db.centerArchives],
     async () => {
       const stamp = (row: { id: string }): { createdAt: number; updatedAt: number } => ({
         createdAt: now + row.id.length,
@@ -357,6 +497,380 @@ export async function seedDemoData(): Promise<void> {
           updatedAt: now
         })
       }
+
+      /* ---------------- 报整编演示档：测站报送档 + 整编端档 ---------------- */
+      const allSections = stationBundles.flatMap((bundle) =>
+        bundle.sections.map((section) => ({ section, stationId: bundle.station.id }))
+      )
+      const allVerticals = stationBundles.flatMap((bundle) =>
+        bundle.verticals.map((vertical) => ({ ...vertical, createdAt: now, updatedAt: now }))
+      )
+      const allPoints = stationBundles.flatMap((bundle) =>
+        bundle.points.map((point) => ({ ...point, createdAt: now, updatedAt: now }))
+      )
+      const submissionRows: SubmissionArchive[] = []
+      const centerRows: CenterArchive[] = []
+
+      const snapshotOf = (sectionId: string) => {
+        const section = allSections.find((item) => item.section.id === sectionId)?.section
+        if (!section) return null
+        const stamped: Section = { ...section, createdAt: now, updatedAt: now }
+        const stampedRatings: Rating[] = ratingSeeds.map((rating) => ({ ...rating, createdAt: now, updatedAt: now }))
+        return buildResultSnapshot(stamped, allVerticals, allPoints, stampedRatings)
+      }
+
+      /** 成对落档：测站报送档与整编端档各一份，按测次号对上 */
+      const pairPut = (submission: SubmissionArchive, center: CenterArchive): void => {
+        submissionRows.push(submission)
+        centerRows.push(center)
+      }
+
+      // 1) sec_lh_2406：已完成，回执未动定线参数
+      {
+        const section = allSections.find((item) => item.section.id === 'sec_lh_2406')!.section
+        const snapshot = snapshotOf(section.id)!
+        const adopted: RatingParams = { ...snapshot.stationParams! }
+        const receipt = buildReceipt({
+          receiptNo: 'HZ-2024-0601',
+          receiptAt: '2024-06-13T10:00:00.000Z',
+          editor: '整编室·何渠',
+          adoptedParams: adopted,
+          snapshot,
+          note: '点据贴合 A 线，按原拟合参数整编'
+        })
+        pairPut(
+          {
+            id: 'sub_lh_2406',
+            sectionId: section.id,
+            stationId: section.stationId,
+            measureNo: section.measureNo,
+            method: section.method,
+            status: '完成',
+            reportSeq: 1,
+            reportedAt: '2024-06-12T12:00:00.000Z',
+            snapshot,
+            receipt,
+            receiptVoided: false,
+            voidReason: '',
+            rejectReason: '',
+            legacyUnmatched: false,
+            legacyBackfilled: false,
+            createdAt: now,
+            updatedAt: now
+          },
+          {
+            id: 'cen_lh_2406',
+            submissionId: 'sub_lh_2406',
+            stationId: section.stationId,
+            sectionId: section.id,
+            measureNo: section.measureNo,
+            method: section.method,
+            status: '完成',
+            reportSeq: 1,
+            receivedAt: '2024-06-12T12:00:00.000Z',
+            lastReceivedAt: '2024-06-12T12:00:00.000Z',
+            snapshot,
+            receipt,
+            remarks: [],
+            legacyUnmatched: false,
+            createdAt: now,
+            updatedAt: now
+          }
+        )
+      }
+
+      // 2) sec_lh_2407：整编中（成果已报，回执未到）
+      {
+        const section = allSections.find((item) => item.section.id === 'sec_lh_2407')!.section
+        const snapshot = snapshotOf(section.id)!
+        pairPut(
+          {
+            id: 'sub_lh_2407',
+            sectionId: section.id,
+            stationId: section.stationId,
+            measureNo: section.measureNo,
+            method: section.method,
+            status: '整编中',
+            reportSeq: 1,
+            reportedAt: '2024-07-18T11:20:00.000Z',
+            snapshot,
+            receipt: null,
+            receiptVoided: false,
+            voidReason: '',
+            rejectReason: '',
+            legacyUnmatched: false,
+            legacyBackfilled: false,
+            createdAt: now,
+            updatedAt: now
+          },
+          {
+            id: 'cen_lh_2407',
+            submissionId: 'sub_lh_2407',
+            stationId: section.stationId,
+            sectionId: section.id,
+            measureNo: section.measureNo,
+            method: section.method,
+            status: '整编中',
+            reportSeq: 1,
+            receivedAt: '2024-07-18T11:20:00.000Z',
+            lastReceivedAt: '2024-07-18T11:20:00.000Z',
+            snapshot,
+            receipt: null,
+            remarks: [],
+            legacyUnmatched: false,
+            createdAt: now,
+            updatedAt: now
+          }
+        )
+      }
+
+      // 3) sec_qj_2408：已完成，整编端动过定线参数（测站已按新参数重算）
+      {
+        const section = allSections.find((item) => item.section.id === 'sec_qj_2408')!.section
+        const snapshot = snapshotOf(section.id)!
+        const station = snapshot.stationParams!
+        const adopted: RatingParams = {
+          lineNo: station.lineNo,
+          a: Number((station.a * 0.96).toFixed(4)),
+          b: station.b,
+          h0: Number((station.h0 - 0.05).toFixed(3))
+        }
+        const receipt = buildReceipt({
+          receiptNo: 'HZ-2024-0804',
+          receiptAt: '2024-08-10T09:30:00.000Z',
+          editor: '整编室·何渠',
+          adoptedParams: adopted,
+          snapshot,
+          note: '洪水绳套回落段偏右，基线 H0 下调 0.05 m、系数 a 折减 4%'
+        })
+        const reapplied = applyReceiptToSubmission(
+          {
+            id: 'sub_qj_2408',
+            sectionId: section.id,
+            stationId: section.stationId,
+            measureNo: section.measureNo,
+            method: section.method,
+            status: '整编中',
+            reportSeq: 1,
+            reportedAt: '2024-08-09T08:00:00.000Z',
+            snapshot,
+            receipt: null,
+            receiptVoided: false,
+            voidReason: '',
+            rejectReason: '',
+            legacyUnmatched: false,
+            legacyBackfilled: false,
+            createdAt: now,
+            updatedAt: now
+          },
+          receipt
+        )
+        pairPut(
+          reapplied,
+          {
+            id: 'cen_qj_2408',
+            submissionId: 'sub_qj_2408',
+            stationId: section.stationId,
+            sectionId: section.id,
+            measureNo: section.measureNo,
+            method: section.method,
+            status: '完成',
+            reportSeq: 1,
+            receivedAt: '2024-08-09T08:00:00.000Z',
+            lastReceivedAt: '2024-08-09T08:00:00.000Z',
+            snapshot,
+            receipt: reapplied.receipt,
+            remarks: [],
+            legacyUnmatched: false,
+            createdAt: now,
+            updatedAt: now
+          }
+        )
+      }
+
+      // 4) sec_qj_2405：被驳回（只重发整编端那份，垂线测点照旧）
+      {
+        const section = allSections.find((item) => item.section.id === 'sec_qj_2405')!.section
+        const snapshot = snapshotOf(section.id)!
+        pairPut(
+          {
+            id: 'sub_qj_2405',
+            sectionId: section.id,
+            stationId: section.stationId,
+            measureNo: section.measureNo,
+            method: section.method,
+            status: '驳回',
+            reportSeq: 1,
+            reportedAt: '2024-05-22T09:00:00.000Z',
+            snapshot,
+            receipt: null,
+            receiptVoided: false,
+            voidReason: '',
+            rejectReason: '浮标系数取用偏大，请核对水面流速系数后重报',
+            legacyUnmatched: false,
+            legacyBackfilled: false,
+            createdAt: now,
+            updatedAt: now
+          },
+          {
+            id: 'cen_qj_2405',
+            submissionId: 'sub_qj_2405',
+            stationId: section.stationId,
+            sectionId: section.id,
+            measureNo: section.measureNo,
+            method: section.method,
+            status: '驳回',
+            reportSeq: 1,
+            receivedAt: '2024-05-22T09:00:00.000Z',
+            lastReceivedAt: '2024-05-22T09:00:00.000Z',
+            snapshot,
+            receipt: null,
+            remarks: [
+              {
+                at: '2024-05-23T15:00:00.000Z',
+                editor: '整编室·何渠',
+                note: '驳回：浮标系数取用偏大，请核对水面流速系数后重报'
+              }
+            ],
+            legacyUnmatched: false,
+            createdAt: now,
+            updatedAt: now
+          }
+        )
+      }
+
+      // 5) sec_bs_2406：回执到过后测站又改了测点，回执作废、退回待整编
+      {
+        const section = allSections.find((item) => item.section.id === 'sec_bs_2406')!.section
+        const snapshot = snapshotOf(section.id)!
+        const receipt = buildReceipt({
+          receiptNo: 'HZ-2024-0605',
+          receiptAt: '2024-06-21T14:00:00.000Z',
+          editor: '整编室·周渝',
+          adoptedParams: { ...snapshot.stationParams! },
+          snapshot,
+          note: '初整编通过'
+        })
+        pairPut(
+          {
+            id: 'sub_bs_2406',
+            sectionId: section.id,
+            stationId: section.stationId,
+            measureNo: section.measureNo,
+            method: section.method,
+            status: '待整编',
+            reportSeq: 1,
+            reportedAt: '2024-06-20T11:00:00.000Z',
+            snapshot,
+            // 回执留痕（作废后仍可查看），以 receiptVoided 标识
+            receipt,
+            receiptVoided: true,
+            voidReason: '测站于 2024-06-22 改动了 2 号垂线的流速测点，原回执作废',
+            rejectReason: '',
+            legacyUnmatched: false,
+            legacyBackfilled: false,
+            createdAt: now,
+            updatedAt: now
+          },
+          {
+            id: 'cen_bs_2406',
+            submissionId: 'sub_bs_2406',
+            stationId: section.stationId,
+            sectionId: section.id,
+            measureNo: section.measureNo,
+            method: section.method,
+            status: '待整编',
+            reportSeq: 1,
+            receivedAt: '2024-06-20T11:00:00.000Z',
+            lastReceivedAt: '2024-06-20T11:00:00.000Z',
+            snapshot,
+            receipt: null,
+            remarks: [
+              {
+                at: '2024-06-22T08:30:00.000Z',
+                editor: '系统',
+                note: '测站改动垂线 / 流速测点，回执 HZ-2024-0605 作废，等待重报'
+              }
+            ],
+            legacyUnmatched: false,
+            createdAt: now,
+            updatedAt: now
+          }
+        )
+      }
+
+      // 6) 升级回填演示：认不出测次的旧档，单列只读保留（2 份带旧回执、1 份无回执）
+      const legacyRows: Array<{ no: string; measureNo: string; stage: number; flow: number; line: string; receipt: boolean; over?: boolean }> = [
+        { no: '1', measureNo: '2023-10-017', stage: 6.88, flow: 398.2, line: 'A', receipt: true },
+        { no: '2', measureNo: '2023-09-012', stage: 5.02, flow: 132.6, line: 'B', receipt: true, over: true },
+        { no: '3', measureNo: '2023-11-021', stage: 7.41, flow: 471.5, line: 'A', receipt: false }
+      ]
+      legacyRows.forEach((item) => {
+        const subId = `sub_legacy_${item.no}`
+        const rated = Number((item.flow * (item.over ? 1.13 : 1.01)).toFixed(2))
+        const deviation = calcDeviationPct(item.flow, rated)
+        const receipt: Receipt | null = item.receipt
+          ? {
+              receiptNo: `HZ-LEGACY-${item.no.padStart(3, '0')}`,
+              receiptAt: '2023-12-01T08:00:00.000Z',
+              editor: '历史资料',
+              adoptedParams: { lineNo: item.line, a: 0, b: 0, h0: 0 },
+              ratedFlow: rated,
+              residualPct: deviation,
+              verdict: judgeDeviation(deviation),
+              paramsChanged: false,
+              note: '升级回填：旧比测记录识别出的回执，定线参数已不可考'
+            }
+          : null
+        submissionRows.push({
+          id: subId,
+          sectionId: '',
+          stationId: '',
+          measureNo: item.measureNo,
+          method: '流速仪',
+          status: item.receipt ? '完成' : '待整编',
+          reportSeq: 0,
+          reportedAt: null,
+          snapshot: {
+            stageM: item.stage,
+            measuredFlow: item.flow,
+            areaM2: 0,
+            meanVelocityMs: 0,
+            verticalCount: 0,
+            pointCount: 0,
+            stationParams: null
+          },
+          receipt,
+          receiptVoided: false,
+          voidReason: '',
+          rejectReason: '',
+          legacyUnmatched: true,
+          legacyBackfilled: true,
+          createdAt: now,
+          updatedAt: now
+        })
+        centerRows.push({
+          id: `cen_legacy_${item.no}`,
+          submissionId: subId,
+          stationId: '',
+          sectionId: '',
+          measureNo: item.measureNo,
+          method: '流速仪',
+          status: item.receipt ? '完成' : '待整编',
+          reportSeq: 0,
+          receivedAt: null,
+          lastReceivedAt: null,
+          snapshot: null,
+          receipt,
+          remarks: [],
+          legacyUnmatched: true,
+          createdAt: now,
+          updatedAt: now
+        })
+      })
+
+      await db.submissions.bulkPut(submissionRows)
+      await db.centerArchives.bulkPut(centerRows)
     }
   )
 }
@@ -375,7 +889,16 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [
+      db.stations,
+      db.sections,
+      db.verticals,
+      db.points,
+      db.ratings,
+      db.compares,
+      db.submissions,
+      db.centerArchives
+    ],
     async () => {
       await Promise.all([
         db.stations.clear(),
@@ -383,7 +906,9 @@ export async function clearAllTables(): Promise<void> {
         db.verticals.clear(),
         db.points.clear(),
         db.ratings.clear(),
-        db.compares.clear()
+        db.compares.clear(),
+        db.submissions.clear(),
+        db.centerArchives.clear()
       ])
     }
   )
@@ -397,15 +922,18 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与导出页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
-    db.stations.count(),
-    db.sections.count(),
-    db.verticals.count(),
-    db.points.count(),
-    db.ratings.count(),
-    db.compares.count()
-  ])
-  return { stations, sections, verticals, points, ratings, compares }
+  const [stations, sections, verticals, points, ratings, compares, submissions, centerArchives] =
+    await Promise.all([
+      db.stations.count(),
+      db.sections.count(),
+      db.verticals.count(),
+      db.points.count(),
+      db.ratings.count(),
+      db.compares.count(),
+      db.submissions.count(),
+      db.centerArchives.count()
+    ])
+  return { stations, sections, verticals, points, ratings, compares, submissions, centerArchives }
 }
 
 /** 写入结构版本号到 localStorage，便于导出页比对 */

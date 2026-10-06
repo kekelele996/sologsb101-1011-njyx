@@ -189,6 +189,8 @@ onMounted(() => {
         :tone="ratingStore.fitQuality.overLimitCount > 0 ? 'warning' : 'success'"
         icon="TrendCharts"
       />
+      <StatBadge label="测站报送档" :value="counts.submissions ?? 0" suffix="份" tone="info" icon="Promotion" />
+      <StatBadge label="整编端档" :value="counts.centerArchives ?? 0" suffix="份" tone="success" icon="OfficeBuilding" />
     </div>
 
     <el-card shadow="never" class="gb-panel">
@@ -290,7 +292,7 @@ onMounted(() => {
       <div class="gb-panel-title">
         <h3>全量 JSON 导入导出</h3>
         <span class="gb-hint">
-          导出内容包含 stations / sections / verticals / points / ratings / compares 六张表
+          导出内容包含 stations / sections / verticals / points / ratings / compares / submissions / centerArchives 八张表（含测站报送档与整编端档）
         </span>
       </div>
 
@@ -333,6 +335,9 @@ onMounted(() => {
         </el-descriptions-item>
         <el-descriptions-item label="点据 / 比测">
           {{ counts.ratings ?? 0 }} / {{ counts.compares ?? 0 }}
+        </el-descriptions-item>
+        <el-descriptions-item label="报送档 / 整编档">
+          {{ counts.submissions ?? 0 }} / {{ counts.centerArchives ?? 0 }}
         </el-descriptions-item>
         <el-descriptions-item label="最近备份时间">
           {{ lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份' }}

@@ -13,6 +13,7 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
+import { useArchiveStore } from '@/stores/archiveStore'
 import { parsePointPaste } from '@/types/point'
 import type { Point } from '@/types/point'
 import { calcMeanVelocity, calcSectionDischarge, velocityFromRevolutions } from '@/utils/flow'
@@ -22,6 +23,7 @@ const route = useRoute()
 const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
+const archiveStore = useArchiveStore()
 
 const verticalId = computed(() => String(route.params.id ?? ''))
 const vertical = computed(() => sectionStore.verticals.find((item) => item.id === verticalId.value) ?? null)
@@ -71,6 +73,9 @@ const verticalPartialFlow = computed(() => {
   const slice = discharge.value.slices.find((item) => item.id === vertical.value?.id)
   return slice ? slice.partialFlow : 0
 })
+
+/** 所属测次的整编状态：回执完成后再改流速测点会导致回执作废 */
+const archiveRow = computed(() => (section.value ? archiveStore.submissionBySection(section.value.id) : null))
 
 /** 流速分布图坐标：相对水深为纵轴、流速为横轴 */
 const chartPoints = computed(() => {
@@ -215,6 +220,7 @@ function fillByRevolutions(): void {
 
 onMounted(() => {
   if (stationStore.stations.length === 0) void initDatabase()
+  archiveStore.start()
   sectionStore.selectVertical(verticalId.value)
 })
 </script>
@@ -268,6 +274,21 @@ onMounted(() => {
           <el-button type="primary" :icon="Plus" @click="openCreate">新增测点</el-button>
         </div>
       </div>
+
+      <el-alert
+        v-if="archiveRow?.status === '完成'"
+        type="info"
+        show-icon
+        :closable="false"
+        title="本测次已有整编回执、整编已完成；现在改动流速测点会让原回执作废，测次退回待整编，需要重新报送并按新回执走。"
+      />
+      <el-alert
+        v-else-if="archiveRow?.receiptVoided"
+        type="warning"
+        show-icon
+        :closable="false"
+        :title="`原整编回执已作废（${archiveRow.voidReason || '测站改动了流速测点'}），本测次已退回待整编，重报后照新回执走。`"
+      />
 
       <div class="gb-stats-row">
         <StatBadge label="测点数" :value="points.length" suffix="点" icon="DataLine" />

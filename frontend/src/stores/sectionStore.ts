@@ -10,6 +10,19 @@ import { createEmptySectionFilter, type SectionFilterState } from '@/types/secti
 import type { Vertical } from '@/types/vertical'
 import { buildRelativeDepths } from '@/types/vertical'
 import type { Point } from '@/types/point'
+import { voidReceiptForSection } from '@/utils/submissionFlow'
+
+/**
+ * 测站改动垂线或流速测点：若该测次已有整编回执，回执作废、测次退回待整编。
+ * 仅作废回执与状态，垂线/测点改动本身照常落库（整编端驳回/撤回不触发本逻辑）。
+ */
+async function invalidateReceipt(sectionId: string, reason: string): Promise<void> {
+  try {
+    await voidReceiptForSection(sectionId, reason)
+  } catch {
+    // 报送档尚未建立时没有回执可作废，属正常路径，忽略
+  }
+}
 
 /** 垂线录入草稿（新增/编辑表单共享结构） */
 export interface VerticalDraft {
@@ -224,18 +237,23 @@ export const useSectionStore = defineStore('section', () => {
       updatedAt: now + index
     }))
     if (pointRows.length > 0) await db.points.bulkPut(pointRows)
+    await invalidateReceipt(sectionId, `新增/修改了 ${row.no} 号垂线布设`)
     return row
   }
 
   async function updateVertical(id: string, patch: Partial<Vertical>): Promise<void> {
     await db.verticals.update(id, { ...patch, updatedAt: Date.now() } as never)
+    const vertical = verticals.value.find((item) => item.id === id)
+    if (vertical) await invalidateReceipt(vertical.sectionId, `修改了 ${vertical.no} 号垂线`)
   }
 
   async function removeVertical(id: string): Promise<void> {
+    const vertical = verticals.value.find((item) => item.id === id)
     await db.transaction('rw', [db.verticals, db.points], async () => {
       await db.points.where('verticalId').equals(id).delete()
       await db.verticals.delete(id)
     })
+    if (vertical) await invalidateReceipt(vertical.sectionId, `删除了 ${vertical.no} 号垂线及其测点`)
   }
 
   /** 按测点数重排该垂线的测点行（保持已有流速值，缺失的补默认） */
@@ -261,6 +279,8 @@ export const useSectionStore = defineStore('section', () => {
       if (rows.length > 0) await db.points.bulkPut(rows)
       await db.verticals.update(verticalId, { pointCount: rows.length, updatedAt: now } as never)
     })
+    const vertical = verticals.value.find((item) => item.id === verticalId)
+    if (vertical) await invalidateReceipt(vertical.sectionId, `按测点数重排了 ${vertical.no} 号垂线的测点`)
     return rows.length
   }
 
@@ -274,17 +294,28 @@ export const useSectionStore = defineStore('section', () => {
     const row: Point = { ...payload, verticalId, id: createId('pnt'), createdAt: now, updatedAt: now }
     await db.points.put(row)
     await syncVerticalPointCount(verticalId)
+    const vertical = verticals.value.find((item) => item.id === verticalId)
+    if (vertical) await invalidateReceipt(vertical.sectionId, `在 ${vertical.no} 号垂线新增了流速测点`)
     return row
   }
 
   async function updatePoint(id: string, patch: Partial<Point>): Promise<void> {
     await db.points.update(id, { ...patch, updatedAt: Date.now() } as never)
+    const point = points.value.find((item) => item.id === id)
+    if (patch.velocityMs !== undefined && point) {
+      const vertical = verticals.value.find((item) => item.id === point.verticalId)
+      if (vertical) await invalidateReceipt(vertical.sectionId, `改动了 ${vertical.no} 号垂线的流速测点`)
+    }
   }
 
   async function removePoint(id: string): Promise<void> {
     const point = points.value.find((item) => item.id === id)
     await db.points.delete(id)
-    if (point) await syncVerticalPointCount(point.verticalId)
+    if (point) {
+      await syncVerticalPointCount(point.verticalId)
+      const vertical = verticals.value.find((item) => item.id === point.verticalId)
+      if (vertical) await invalidateReceipt(vertical.sectionId, `删除了 ${vertical.no} 号垂线的流速测点`)
+    }
   }
 
   /** 批量改写某垂线全部测点流速（批量录入） */
@@ -297,6 +328,8 @@ export const useSectionStore = defineStore('section', () => {
         point.velocityMs = velocityMs
         point.updatedAt = now
       })
+    const vertical = verticals.value.find((item) => item.id === verticalId)
+    if (vertical) await invalidateReceipt(vertical.sectionId, `批量改写了 ${vertical.no} 号垂线的测点流速`)
     return pointsOfVertical(verticalId).length
   }
 
@@ -321,6 +354,8 @@ export const useSectionStore = defineStore('section', () => {
       await db.points.bulkPut(records)
       await db.verticals.update(verticalId, { pointCount: records.length, updatedAt: now } as never)
     })
+    const vertical = verticals.value.find((item) => item.id === verticalId)
+    if (vertical) await invalidateReceipt(vertical.sectionId, `批量粘贴重录了 ${vertical.no} 号垂线的测点`)
     return records.length
   }
 
@@ -335,6 +370,8 @@ export const useSectionStore = defineStore('section', () => {
     if (rows.length === 0) return 0
     const weight = Number((1 / rows.length).toFixed(4))
     await db.points.bulkPut(rows.map((row) => ({ ...row, weight, updatedAt: Date.now() })))
+    const vertical = verticals.value.find((item) => item.id === verticalId)
+    if (vertical) await invalidateReceipt(vertical.sectionId, `归一化了 ${vertical.no} 号垂线的测点权重`)
     return rows.length
   }
 

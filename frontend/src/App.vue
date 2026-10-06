@@ -5,10 +5,11 @@
  */
 import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { DataLine, Files, Histogram, Odometer, PieChart, TrendCharts } from '@element-plus/icons-vue'
+import { DataLine, Files, Histogram, Odometer, OfficeBuilding, PieChart, TrendCharts } from '@element-plus/icons-vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
 import { useRatingStore } from '@/stores/ratingStore'
+import { useArchiveStore } from '@/stores/archiveStore'
 import { DB_NAME, DB_VERSION } from '@/utils/db'
 
 const route = useRoute()
@@ -16,11 +17,13 @@ const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
 const ratingStore = useRatingStore()
+const archiveStore = useArchiveStore()
 
 onMounted(() => {
   stationStore.start()
   sectionStore.start()
   ratingStore.start()
+  archiveStore.start()
 })
 
 /** 层级路由统一归属到最上层导航项 */
@@ -34,6 +37,12 @@ const activeKey = computed(() => {
 const navItems = computed(() => [
   { key: '/stations', label: '测站台账', icon: Odometer, badge: String(stationStore.stations.length) },
   { key: '/ratings', label: '关系点据与定线', icon: TrendCharts, badge: String(ratingStore.ratings.length) },
+  {
+    key: '/center',
+    label: '流域整编中心',
+    icon: OfficeBuilding,
+    badge: String(archiveStore.pendingCenterCount)
+  },
   { key: '/export', label: '比测与导出', icon: PieChart, badge: String(ratingStore.overLimitRows.length) }
 ])
 
@@ -116,7 +125,8 @@ function go(path: string): void {
       <span>
         测站 {{ stationStore.stations.length }} · 测次 {{ sectionStore.sections.length }} · 垂线
         {{ sectionStore.verticals.length }} · 测点 {{ sectionStore.points.length }} · 点据
-        {{ ratingStore.ratings.length }}
+        {{ ratingStore.ratings.length }} · 整编
+        {{ archiveStore.statusCounts.完成 }}/{{ archiveStore.submissions.filter((row) => !row.legacyUnmatched).length }}
       </span>
     </footer>
   </div>

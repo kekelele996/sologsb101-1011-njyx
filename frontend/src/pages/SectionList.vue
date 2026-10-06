@@ -14,13 +14,16 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
+import { useArchiveStore } from '@/stores/archiveStore'
 import { MEASURE_METHODS, type MeasureMethod, type Section } from '@/types/section'
+import { STATUS_TAG_TYPE, type SubmissionArchive } from '@/types/submission'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
 const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
+const archiveStore = useArchiveStore()
 
 const stationId = computed(() => String(route.params.id ?? ''))
 const station = computed(() => stationStore.stationById(stationId.value))
@@ -174,8 +177,51 @@ function reseedIfEmpty(): void {
   if (stationStore.stations.length === 0) void initDatabase()
 }
 
+/* ------------------------------ 报整编 ------------------------------ */
+
+const submittingId = ref<string | null>(null)
+const receiptRow = ref<SubmissionArchive | null>(null)
+
+function archiveOf(section: Section): SubmissionArchive | null {
+  return archiveStore.submissionBySection(section.id)
+}
+
+async function reportSection(section: Section): Promise<void> {
+  const verticalCount = sectionStore.sectionVerticalCounts[section.id] ?? 0
+  if (verticalCount === 0) {
+    ElMessage.warning('该测次还没有垂线成果，请先布设垂线并录入流速测点再报整编')
+    return
+  }
+  const existing = archiveOf(section)
+  const action = existing && existing.reportSeq > 0 ? '重新报送' : '报送'
+  try {
+    await ElMessageBox.confirm(
+      `将测次「${section.measureNo}」的测流成果${action}至流域整编中心？报送后整编端按测次号对档。`,
+      `${action}确认`,
+      { type: 'info', confirmButtonText: action, cancelButtonText: '取消' }
+    )
+  } catch {
+    return
+  }
+  submittingId.value = section.id
+  try {
+    const row = await archiveStore.submitSection(section.id)
+    ElMessage.success(`成果已${action}，测次进入整编中；回执到达后才算完成（第 ${row.reportSeq} 次报送）`)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '报送失败')
+  } finally {
+    submittingId.value = null
+  }
+}
+
+function viewReceipt(section: Section): void {
+  const row = archiveOf(section)
+  if (row?.receipt) receiptRow.value = row
+}
+
 onMounted(() => {
   reseedIfEmpty()
+  archiveStore.start()
   const query = route.query
   sectionStore.patchFilter({
     keyword: typeof query.kw === 'string' ? query.kw : '',
@@ -303,10 +349,49 @@ onMounted(() => {
             <span class="gb-mono">{{ new Date(row.measuredAt).toLocaleString('zh-CN') }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="240" fixed="right">
+        <el-table-column label="整编状态" min-width="200">
+          <template #default="{ row }">
+            <template v-if="archiveOf(row)">
+              <el-tag size="small" :type="STATUS_TAG_TYPE[archiveOf(row)!.status]" effect="light">
+                {{ archiveOf(row)!.status }}
+              </el-tag>
+              <el-tag v-if="archiveOf(row)!.reportSeq > 0" size="small" effect="plain" class="page__seq">
+                第 {{ archiveOf(row)!.reportSeq }} 报
+              </el-tag>
+              <el-tooltip
+                v-if="archiveOf(row)!.receiptVoided"
+                content="测站改动过垂线或流速测点，原整编回执已作废，测次退回待整编，重报后照新回执走"
+                placement="top"
+              >
+                <el-tag size="small" type="warning" effect="dark">回执作废</el-tag>
+              </el-tooltip>
+              <el-button
+                v-if="archiveOf(row)!.receipt"
+                text
+                size="small"
+                type="primary"
+                @click="viewReceipt(row)"
+              >
+                查看回执
+              </el-button>
+              <el-tooltip v-if="archiveOf(row)!.rejectReason" :content="archiveOf(row)!.rejectReason" placement="top">
+                <el-tag size="small" type="danger" effect="plain">驳回因由</el-tag>
+              </el-tooltip>
+            </template>
+            <el-button v-else text size="small" type="primary" @click="reportSection(row)">报整编</el-button>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="300" fixed="right">
           <template #default="{ row }">
             <el-button size="small" type="primary" :icon="Right" @click="gotoVerticals(row)">垂线</el-button>
             <el-button size="small" :icon="Edit" @click="openEdit(row)">编辑</el-button>
+            <el-button
+              size="small"
+              :loading="submittingId === row.id"
+              @click="reportSection(row)"
+            >
+              {{ archiveOf(row)?.reportSeq ? '重报整编' : '报整编' }}
+            </el-button>
             <el-button size="small" type="danger" plain :icon="Delete" @click="removeSection(row)">删除</el-button>
           </template>
         </el-table-column>
@@ -317,7 +402,7 @@ onMounted(() => {
 
       <p class="gb-hint">
         <el-icon><Timer /></el-icon>
-        提示：测次的水位将参与水位流量关系点据定线；同一测次下的垂线按起点距升序参与部分面积法流量计算。
+        提示：测次的水位将参与水位流量关系点据定线；同一测次下的垂线按起点距升序参与部分面积法流量计算。测流成果报流域整编中心后，测站与整编端各留各的档，回执到达该测次才算完成；回执到达后再改动垂线或流速测点，回执作废、退回待整编。
       </p>
     </template>
 
@@ -349,6 +434,48 @@ onMounted(() => {
           {{ editingId ? '保存修改' : '新增并布设垂线' }}
         </el-button>
       </template>
+    </el-dialog>
+
+    <!-- 整编回执：写明整编端采用的定线参数与整编流量 -->
+    <el-dialog v-model="receiptRow" title="整编回执" width="560px">
+      <el-descriptions v-if="receiptRow?.receipt" :column="1" border size="small">
+        <el-descriptions-item label="测次号">{{ receiptRow.measureNo }}</el-descriptions-item>
+        <el-descriptions-item label="回执编号">{{ receiptRow.receipt.receiptNo }}</el-descriptions-item>
+        <el-descriptions-item label="回执时间">
+          {{ new Date(receiptRow.receipt.receiptAt).toLocaleString('zh-CN') }}
+        </el-descriptions-item>
+        <el-descriptions-item label="整编员">{{ receiptRow.receipt.editor }}</el-descriptions-item>
+        <el-descriptions-item label="采用定线参数">
+          <span class="gb-mono">
+            {{ receiptRow.receipt.adoptedParams.lineNo }} 线
+            Q={{ receiptRow.receipt.adoptedParams.a }}·(H-{{ receiptRow.receipt.adoptedParams.h0 }})^{{
+              receiptRow.receipt.adoptedParams.b
+            }}
+          </span>
+          <el-tag
+            size="small"
+            :type="receiptRow.receipt.paramsChanged ? 'warning' : 'success'"
+            effect="plain"
+            style="margin-left: 8px"
+          >
+            {{ receiptRow.receipt.paramsChanged ? '动过参数，已按新参数重算' : '未动参数' }}
+          </el-tag>
+        </el-descriptions-item>
+        <el-descriptions-item label="实测 / 整编流量">
+          <span class="gb-mono">
+            {{ receiptRow.snapshot?.measuredFlow.toFixed(2) }} → {{ receiptRow.receipt.ratedFlow }} m³/s
+          </span>
+        </el-descriptions-item>
+        <el-descriptions-item label="残差 / 比测结论">
+          <el-tag size="small" :type="receiptRow.receipt.verdict === '合格' ? 'success' : 'danger'">
+            {{ receiptRow.receipt.verdict }}（残差 {{ receiptRow.receipt.residualPct }}%）
+          </el-tag>
+        </el-descriptions-item>
+        <el-descriptions-item label="整编意见">{{ receiptRow.receipt.note || '—' }}</el-descriptions-item>
+      </el-descriptions>
+      <p class="gb-hint">
+        回执到达后本测次才算完成；若再改动该测次的垂线或流速测点，本回执作废、测次退回待整编，重报后按新回执走。
+      </p>
     </el-dialog>
   </section>
 </template>
@@ -386,5 +513,9 @@ onMounted(() => {
   margin-left: 8px;
   font-size: 12px;
   color: #8194a2;
+}
+
+.page__seq {
+  margin-left: 4px;
 }
 </style>

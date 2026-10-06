@@ -5,7 +5,22 @@
  */
 import { computed } from 'vue'
 import type { Component } from 'vue'
-import { DataLine, Files, Histogram, Odometer, PieChart, TrendCharts, WarningFilled } from '@element-plus/icons-vue'
+import {
+  Bell,
+  CircleCheck,
+  CircleClose,
+  DataLine,
+  Files,
+  Histogram,
+  Loading,
+  Lock,
+  Odometer,
+  OfficeBuilding,
+  PieChart,
+  Promotion,
+  TrendCharts,
+  WarningFilled
+} from '@element-plus/icons-vue'
 
 type BadgeTone = 'default' | 'primary' | 'success' | 'warning' | 'danger' | 'info'
 
@@ -44,11 +59,18 @@ const toneColor: Record<BadgeTone, string> = {
 }
 
 const iconMap: Record<string, Component> = {
+  Bell,
+  CircleCheck,
+  CircleClose,
   DataLine,
   Files,
   Histogram,
+  Loading,
+  Lock,
   Odometer,
+  OfficeBuilding,
   PieChart,
+  Promotion,
   TrendCharts,
   WarningFilled
 }
